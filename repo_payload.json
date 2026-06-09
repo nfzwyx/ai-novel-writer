@@ -1,0 +1,6 @@
+{
+  "name": "ai-novel-writer",
+  "description": "AI 小说创作助手 - 基于 AI 的中文小说创作工具，支持大纲生成、章节写作、文本润色等功能",
+  "private": false,
+  "auto_init": false
+}

@@ -1,16 +1,28 @@
-"""AI 小说创作助手 - Streamlit Web UI"""
+"""AI 小说创作助手 - Streamlit Web UI（无 API Key 版）
+通过文件与 WorkBuddy 通信，由 WorkBuddy 内置 AI 直接生成内容。
+"""
 
 import streamlit as st
 import os
 import json
 import re
+import time
 from datetime import datetime
+from pathlib import Path
+
 from novel_generator import (
     generate_novel_outline,
     generate_chapter_content,
     polish_text,
     continue_writing,
 )
+
+# ── 通信目录设置 ──────────────────────────────────────────
+WORKBUDDY_DIR = Path.home() / ".workbuddy" / "ai_novel_writer"
+WORKBUDDY_DIR.mkdir(parents=True, exist_ok=True)
+PROMPT_FILE = WORKBUDDY_DIR / "prompt.txt"
+RESPONSE_FILE = WORKBUDDY_DIR / "response.txt"
+STATUS_FILE = WORKBUDDY_DIR / "status.txt"
 
 # ── 页面配置 ──────────────────────────────────────────────
 st.set_page_config(
@@ -21,83 +33,170 @@ st.set_page_config(
 
 # ── 初始化 session_state ──────────────────────────────────
 if "novel" not in st.session_state:
-    st.session_state.novel = None  # 小说大纲数据
+    st.session_state.novel = None
 if "chapters" not in st.session_state:
-    st.session_state.chapters = {}  # {chapter_number: content}
+    st.session_state.chapters = {}
 if "current_chapter" not in st.session_state:
     st.session_state.current_chapter = 1
 if "genre" not in st.session_state:
     st.session_state.genre = "玄幻"
-if "api_configured" not in st.session_state:
-    st.session_state.api_configured = False
+if "ai_prompt" not in st.session_state:
+    st.session_state.ai_prompt = ""
+if "ai_response" not in st.session_state:
+    st.session_state.ai_response = ""
+if "ai_pending" not in st.session_state:
+    st.session_state.ai_pending = False
+if "last_req_id" not in st.session_state:
+    st.session_state.last_req_id = 0
 
-# ── 侧边栏：API 配置 ─────────────────────────────────────
+
+# ── 侧边栏 ────────────────────────────────────────────────
 with st.sidebar:
     st.title("✍️ AI 小说创作助手")
+    st.caption("由 WorkBuddy AI 驱动，无需 API Key")
     st.divider()
 
-    st.subheader("⚙️ API 配置")
-    api_key = st.text_input(
-        "API Key",
-        type="password",
-        value=os.getenv("OPENAI_API_KEY", ""),
-        help="支持 OpenAI / DeepSeek / 其他兼容 API",
-    )
-    api_base = st.text_input(
-        "API Base URL（可选）",
-        value=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        help="DeepSeek 填 https://api.deepseek.com/v1",
-    )
-    model_name = st.text_input(
-        "模型名称",
-        value=os.getenv("MODEL_NAME", "gpt-4o"),
-        help="DeepSeek 填 deepseek-chat",
-    )
-
-    if api_key:
-        st.session_state.api_configured = True
-        os.environ["OPENAI_API_KEY"] = api_key
-        os.environ["OPENAI_BASE_URL"] = api_base
-        os.environ["MODEL_NAME"] = model_name
-        st.success("✅ API 已配置")
-    else:
-        st.warning("⚠️ 请先配置 API Key")
-        st.caption("获取 Key 后填入上方输入框")
-
-    st.divider()
-
-    # 导航
     st.subheader("📂 导航")
     page = st.radio(
         "选择功能",
         ["🏠 新建小说", "📋 大纲管理", "📝 章节写作", "✨ 文本润色", "💾 导出小说"],
     )
 
-# ── 调用 AI 的通用函数 ────────────────────────────────────
-def call_ai(prompt: str, max_tokens: int = 4096) -> str:
-    """调用配置好的 AI 模型"""
-    try:
-        from openai import OpenAI
+    st.divider()
+    st.caption(f"📁 通信目录：\n`{WORKBUDDY_DIR}`")
 
-        client = OpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL"),
+
+# ── 调用 AI：文件通信方式 ────────────────────────────────
+def call_ai_via_file(prompt: str, max_tokens: int = 4096, timeout: int = 120) -> str:
+    """通过文件与 WorkBuddy 通信，获取 AI 生成结果"""
+    # 写入请求
+    req_id = int(time.time())
+    st.session_state.last_req_id = req_id
+    st.session_state.ai_pending = True
+    st.session_state.ai_prompt = prompt
+
+    PROMPT_FILE.write_text(prompt, encoding="utf-8")
+    STATUS_FILE.write_text(f"pending:{req_id}", encoding="utf-8")
+    if RESPONSE_FILE.exists():
+        RESPONSE_FILE.unlink()
+
+    # 等待响应（在 Streamlit 中通过 rerun 轮询）
+    st.session_state.ai_wait_start = time.time()
+    st.session_state.ai_timeout = timeout
+    st.rerun()
+
+
+def check_ai_response() -> str | None:
+    """检查是否有 AI 响应返回（在下次 rerun 时调用）"""
+    if not st.session_state.get("ai_pending"):
+        return st.session_state.get("ai_response", "")
+
+    # 检查是否超时
+    if time.time() - st.session_state.get("ai_wait_start", 0) > st.session_state.get("ai_timeout", 120):
+        st.session_state.ai_pending = False
+        return None  # 超时
+
+    # 检查响应文件
+    if RESPONSE_FILE.exists():
+        status = STATUS_FILE.read_text(encoding="utf-8").strip() if STATUS_FILE.exists() else ""
+        if status.startswith("done"):
+            result = RESPONSE_FILE.read_text(encoding="utf-8")
+            st.session_state.ai_pending = False
+            st.session_state.ai_response = result
+            if RESPONSE_FILE.exists():
+                RESPONSE_FILE.unlink()
+            return result
+
+    # 还未完成，需要 rerun
+    return None
+
+
+def request_ai_and_wait(prompt: str, max_tokens: int = 4096) -> str:
+    """请求 AI 并在当前 turn 通过文件等待结果（用于非 Streamlit 上下文）"""
+    req_id = int(time.time())
+    PROMPT_FILE.write_text(prompt, encoding="utf-8")
+    STATUS_FILE.write_text(f"pending:{req_id}", encoding="utf-8")
+    if RESPONSE_FILE.exists():
+        RESPONSE_FILE.unlink()
+
+    # 轮询等待（最多 120 秒）
+    for _ in range(120):
+        time.sleep(1)
+        if RESPONSE_FILE.exists():
+            status = STATUS_FILE.read_text(encoding="utf-8").strip() if STATUS_FILE.exists() else ""
+            if status.startswith("done"):
+                result = RESPONSE_FILE.read_text(encoding="utf-8")
+                RESPONSE_FILE.unlink()
+                return result
+    return ""
+
+
+# ── AI 请求面板（通用组件） ─────────────────────────────
+def render_ai_panel():
+    """渲染 AI 请求面板：显示 prompt + 等待区 + 响应粘贴区"""
+    if not st.session_state.get("ai_pending"):
+        return st.session_state.get("ai_response", "")
+
+    st.info("🤖 **WorkBuddy AI 正在生成中…**\n\n"
+            "请切换到 WorkBuddy 对话窗口，\n"
+            "我会读取 prompt 并生成回复。")
+
+    with st.expander("📄 当前 Prompt（可复制）", expanded=False):
+        st.text_area(
+            "复制以下内容发送给 WorkBuddy：",
+            value=st.session_state.get("ai_prompt", ""),
+            height=200,
+            key="prompt_display",
+            label_visibility="collapsed",
         )
-        resp = client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "gpt-4o"),
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            temperature=0.8,
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        st.error(f"AI 调用失败：{e}")
-        return ""
+
+    # 粘贴响应区
+    st.subheader("📥 粘贴 AI 回复")
+    pasted = st.text_area(
+        "将 WorkBuddy 的回复粘贴到这里：",
+        height=300,
+        key="paste_response_area",
+        label_visibility="collapsed",
+    )
+
+    col_confirm, col_cancel = st.columns(2)
+    with col_confirm:
+        if st.button("✅ 确认收到回复", type="primary", use_container_width=True):
+            if pasted.strip():
+                # 写入响应文件以通知等待中的进程
+                RESPONSE_FILE.write_text(pasted, encoding="utf-8")
+                STATUS_FILE.write_text("done", encoding="utf-8")
+                st.session_state.ai_response = pasted
+                st.session_state.ai_pending = False
+                st.rerun()
+    with col_cancel:
+        if st.button("❌ 取消", use_container_width=True):
+            st.session_state.ai_pending = False
+            if STATUS_FILE.exists():
+                STATUS_FILE.write_text("cancelled", encoding="utf-8")
+            st.rerun()
+
+    # 自动轮询：检查响应文件是否已被写入（WorkBuddy 直接写入方式）
+    if RESPONSE_FILE.exists():
+        status = STATUS_FILE.read_text(encoding="utf-8").strip() if STATUS_FILE.exists() else ""
+        if status.startswith("done") or not status.startswith("pending"):
+            result = RESPONSE_FILE.read_text(encoding="utf-8")
+            st.session_state.ai_response = result
+            st.session_state.ai_pending = False
+            if RESPONSE_FILE.exists():
+                RESPONSE_FILE.unlink()
+            st.rerun()
+
+    st.stop()  # 暂停页面渲染，等待响应
 
 
 # ── 页面 1：新建小说 ──────────────────────────────────────
 if page == "🏠 新建小说":
     st.title("🏠 新建小说项目")
+
+    # 如果正在等待 AI 响应，显示面板并暂停
+    if st.session_state.get("ai_pending"):
+        render_ai_panel()
 
     col1, col2 = st.columns([2, 1])
 
@@ -108,6 +207,7 @@ if page == "🏠 新建小说":
         )
         if genre == "其他":
             genre = st.text_input("请输入题材名称")
+        st.session_state.genre = genre
 
         theme = st.text_area(
             "小说设定 / 灵感描述",
@@ -130,30 +230,35 @@ if page == "🏠 新建小说":
     if st.button("✨ 生成大纲", type="primary", use_container_width=True):
         if not theme.strip():
             st.warning("请先填写小说设定！")
-        elif not st.session_state.api_configured:
-            st.warning("请先在侧边栏配置 API Key！")
         else:
-            with st.spinner("AI 正在构思大纲，请稍候…"):
-                outline_data = generate_novel_outline(theme, genre, num_chapters)
-                prompt = outline_data["prompt"]
+            outline_data = generate_novel_outline(theme, genre, num_chapters)
+            prompt = outline_data["prompt"]
+            st.session_state.ai_prompt = prompt
+            st.session_state.ai_pending = True
+            st.session_state.ai_response = ""
+            PROMPT_FILE.write_text(prompt, encoding="utf-8")
+            STATUS_FILE.write_text(f"pending:{int(time.time())}", encoding="utf-8")
+            if RESPONSE_FILE.exists():
+                RESPONSE_FILE.unlink()
+            st.rerun()
 
-                result = call_ai(prompt, max_tokens=4096)
-
-                # 尝试解析 JSON
-                try:
-                    # 提取 JSON（可能有 markdown 代码块包裹）
-                    json_match = re.search(r"```json\s*(.*?)\s*```", result, re.DOTALL)
-                    if json_match:
-                        result = json_match.group(1)
-                    novel_data = json.loads(result)
-                    st.session_state.novel = novel_data
-                    st.session_state.chapters = {}
-                    st.session_state.genre = genre
-                    st.success("✅ 大纲生成成功！请切换到「大纲管理」查看")
-                    st.rerun()
-                except json.JSONDecodeError:
-                    st.error("大纲解析失败，请重试。原始输出：")
-                    st.text(result[:500])
+    # 如果刚收到响应，解析大纲
+    if st.session_state.get("ai_response") and not st.session_state.get("ai_pending"):
+        result = st.session_state.ai_response
+        try:
+            json_match = re.search(r"```json\s*(.*?)\s*```", result, re.DOTALL)
+            if json_match:
+                result = json_match.group(1)
+            novel_data = json.loads(result)
+            st.session_state.novel = novel_data
+            st.session_state.chapters = {}
+            st.session_state.genre = genre if 'genre' in dir() else st.session_state.genre
+            st.success("✅ 大纲生成成功！请切换到「大纲管理」查看")
+            st.session_state.ai_response = ""  # 清空
+            st.rerun()
+        except (json.JSONDecodeError, Exception) as e:
+            st.error(f"大纲解析失败：{e}")
+            st.text_area("原始 AI 输出（请检查格式）：", value=result, height=300)
 
 # ── 页面 2：大纲管理 ──────────────────────────────────────
 elif page == "📋 大纲管理":
@@ -196,6 +301,9 @@ elif page == "📋 大纲管理":
 elif page == "📝 章节写作":
     st.title("📝 章节写作")
 
+    if st.session_state.get("ai_pending"):
+        render_ai_panel()
+
     if not st.session_state.novel:
         st.info("📭 请先生成小说大纲！")
         st.stop()
@@ -204,7 +312,6 @@ elif page == "📝 章节写作":
     chapters_outline = novel.get("chapters", [])
     total = len(chapters_outline)
 
-    # 章节选择器
     col_sel, col_info = st.columns([1, 3])
     with col_sel:
         ch_num = st.number_input(
@@ -214,7 +321,6 @@ elif page == "📝 章节写作":
             value=st.session_state.current_chapter,
         )
         st.session_state.current_chapter = int(ch_num)
-
     with col_info:
         if ch_num <= total:
             ch_info = chapters_outline[int(ch_num) - 1]
@@ -223,59 +329,65 @@ elif page == "📝 章节写作":
 
     st.divider()
 
-    # 获取/生成章节内容
     content_key = f"content_{ch_num}"
     if content_key not in st.session_state:
         st.session_state[content_key] = st.session_state.chapters.get(str(ch_num), "")
 
-    # 生成按钮
     col_btn1, col_btn2, col_btn3 = st.columns(3)
     with col_btn1:
         if st.button("✨ 生成本章内容", type="primary"):
-            if not st.session_state.api_configured:
-                st.warning("请先配置 API Key！")
-            else:
-                with st.spinner("AI 正在写作，请稍候…"):
-                    ch_info = chapters_outline[int(ch_num) - 1] if ch_num <= total else {"title": f"第{ch_num}章", "summary": ""}
-                    prev_text = ""
-                    for i in range(1, ch_num):
-                        prev_text += st.session_state.chapters.get(str(i), "")
+            ch_info = (
+                chapters_outline[int(ch_num) - 1]
+                if ch_num <= total
+                else {"title": f"第{ch_num}章", "summary": ""}
+            )
+            prev_text = ""
+            for i in range(1, int(ch_num)):
+                prev_text += st.session_state.chapters.get(str(i), "")
 
-                    chars = novel.get("characters", [])
-                    prompt = generate_chapter_content(
-                        novel.get("title", ""),
-                        ch_info.get("title", ""),
-                        ch_info.get("summary", ""),
-                        prev_text,
-                        chars,
-                        st.session_state.genre,
-                    )
-                    result = call_ai(prompt, max_tokens=4096)
-                    if result:
-                        st.session_state[content_key] = result
-                        st.session_state.chapters[str(ch_num)] = result
-                        st.rerun()
+            chars = novel.get("characters", [])
+            prompt = generate_chapter_content(
+                novel.get("title", ""),
+                ch_info.get("title", ""),
+                ch_info.get("summary", ""),
+                prev_text,
+                chars,
+                st.session_state.genre,
+            )
+            st.session_state.ai_prompt = prompt
+            st.session_state.ai_pending = True
+            st.session_state.ai_response = ""
+            PROMPT_FILE.write_text(prompt, encoding="utf-8")
+            STATUS_FILE.write_text(f"pending:{int(time.time())}", encoding="utf-8")
+            if RESPONSE_FILE.exists():
+                RESPONSE_FILE.unlink()
+            st.rerun()
 
     with col_btn2:
         if st.button("➡️ 续写当前内容"):
-            if not st.session_state.api_configured:
-                st.warning("请先配置 API Key！")
-            else:
-                current = st.session_state.get(content_key, "")
-                if current:
-                    with st.spinner("AI 正在续写…"):
-                        prompt = continue_writing(current)
-                        result = call_ai(prompt, max_tokens=2048)
-                        if result:
-                            new_content = current + "\n\n" + result
-                            st.session_state[content_key] = new_content
-                            st.session_state.chapters[str(ch_num)] = new_content
-                            st.rerun()
+            current = st.session_state.get(content_key, "")
+            if current:
+                prompt = continue_writing(current)
+                st.session_state.ai_prompt = prompt
+                st.session_state.ai_pending = True
+                st.session_state.ai_response = ""
+                PROMPT_FILE.write_text(prompt, encoding="utf-8")
+                STATUS_FILE.write_text(f"pending:{int(time.time())}", encoding="utf-8")
+                if RESPONSE_FILE.exists():
+                    RESPONSE_FILE.unlink()
+                st.rerun()
 
     with col_btn3:
         target_words = st.number_input("目标字数", min_value=500, value=2000, step=500)
 
-    # 编辑区
+    # 如果刚收到响应，更新章节内容
+    if st.session_state.get("ai_response") and not st.session_state.get("ai_pending"):
+        result = st.session_state.ai_response
+        st.session_state[content_key] = result
+        st.session_state.chapters[str(ch_num)] = result
+        st.session_state.ai_response = ""
+        st.rerun()
+
     st.subheader("✏️ 编辑区")
     edited = st.text_area(
         "章节正文",
@@ -286,7 +398,6 @@ elif page == "📝 章节写作":
     st.session_state[content_key] = edited
     st.session_state.chapters[str(ch_num)] = edited
 
-    # 字数统计
     word_count = len(edited)
     col_wc1, col_wc2 = st.columns([1, 4])
     with col_wc1:
@@ -299,6 +410,9 @@ elif page == "📝 章节写作":
 # ── 页面 4：文本润色 ──────────────────────────────────────
 elif page == "✨ 文本润色":
     st.title("✨ 文本润色 / 改写")
+
+    if st.session_state.get("ai_pending"):
+        render_ai_panel()
 
     if not st.session_state.novel:
         st.info("📭 请先生成小说大纲！")
@@ -330,15 +444,22 @@ elif page == "✨ 文本润色":
     if st.button("✨ 开始润色", type="primary"):
         if not source_text.strip():
             st.warning("请先粘贴原文！")
-        elif not st.session_state.api_configured:
-            st.warning("请先配置 API Key！")
         else:
-            with st.spinner("AI 正在润色…"):
-                prompt = polish_text(source_text, custom_instruction)
-                result = call_ai(prompt, max_tokens=4096)
-                if result:
-                    st.subheader("✅ 润色结果")
-                    st.text_area("润色后", value=result, height=300, label_visibility="collapsed")
+            prompt = polish_text(source_text, custom_instruction)
+            st.session_state.ai_prompt = prompt
+            st.session_state.ai_pending = True
+            st.session_state.ai_response = ""
+            PROMPT_FILE.write_text(prompt, encoding="utf-8")
+            STATUS_FILE.write_text(f"pending:{int(time.time())}", encoding="utf-8")
+            if RESPONSE_FILE.exists():
+                RESPONSE_FILE.unlink()
+            st.rerun()
+
+    if st.session_state.get("ai_response") and not st.session_state.get("ai_pending"):
+        result = st.session_state.ai_response
+        st.subheader("✅ 润色结果")
+        st.text_area("润色后", value=result, height=300, label_visibility="collapsed")
+        st.session_state.ai_response = ""
 
 # ── 页面 5：导出小说 ──────────────────────────────────────
 elif page == "💾 导出小说":
@@ -353,13 +474,12 @@ elif page == "💾 导出小说":
 
     st.subheader(f"📕 {novel.get('title', '未命名小说')}")
 
-    # 汇总预览
     full_text = f"# {novel.get('title', '未命名小说')}\n\n"
     full_text += f"## 简介\n{novel.get('summary', '')}\n\n"
 
     full_text += "## 角色介绍\n"
     for c in novel.get("characters", []):
-        full_text += f"**{c['name']}**（{c.get('role', '角色')}）：{c.get('description', '')}\n\n"
+        full_text += f"**{c['name']}**（`{c.get('role', '角色')}`）：{c.get('description', '')}\n\n"
 
     full_text += "---\n\n"
     for ch_num in sorted(chapters.keys(), key=lambda x: int(x)):
@@ -369,14 +489,12 @@ elif page == "💾 导出小说":
             title = ch_info["title"] if ch_info else f"第{ch_num}章"
             full_text += f"# 第{ch_num}章 {title}\n\n{ch_content}\n\n---\n\n"
 
-    # 统计
     total_words = len(full_text)
     written_chapters = sum(1 for v in chapters.values() if v.strip())
     st.info(f"已写 {written_chapters} 章，共约 {total_words} 字")
 
     st.text_area("预览", value=full_text[:3000] + ("…" if len(full_text) > 3000 else ""), height=300)
 
-    # 下载按钮
     st.download_button(
         label="📥 下载为 TXT 文件",
         data=full_text,
@@ -384,9 +502,28 @@ elif page == "💾 导出小说":
         mime="text/plain",
     )
 
-    # 保存为本地文件
     if st.button("💾 保存到工作区"):
         output_path = f"novel_output_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(full_text)
         st.success(f"✅ 已保存到工作区：`{output_path}`")
+
+
+# ── 底部：通信状态指示 ────────────────────────────────────
+st.divider()
+with st.container():
+    col_a, col_b = st.columns([3, 1])
+    with col_a:
+        if STATUS_FILE.exists():
+            status = STATUS_FILE.read_text(encoding="utf-8").strip()
+            if status.startswith("pending"):
+                st.caption("🟡 等待 WorkBuddy AI 响应中…")
+            elif status.startswith("done"):
+                st.caption("🟢 WorkBuddy AI 响应已就绪")
+            else:
+                st.caption("⚪ 就绪，等待新的生成请求")
+        else:
+            st.caption("⚪ 就绪，等待新的生成请求")
+    with col_b:
+        if st.button("🔄 刷新", help="手动刷新页面状态"):
+            st.rerun()
